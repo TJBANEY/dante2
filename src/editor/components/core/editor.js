@@ -37,6 +37,13 @@ import customHTML2Content from '../../utils/html2content'
 import createStyles from 'draft-js-custom-styles'
 
 export default class DanteEditor extends React.Component {
+  static defaultProps = {
+    defaultBlockRenderMap: true,
+    defaultKeyBindings: true,
+    defaultKeyCommands: true,
+    plugins: [],
+  };
+
   constructor(props) {
     super(props)
 
@@ -106,6 +113,12 @@ export default class DanteEditor extends React.Component {
       editorContent: this.emitSerializedOutput()
     })
     this.focus = false
+
+    const plugins = [this.props, ...this.resolvePlugins()];
+    plugins.forEach(plugin => {
+      if (typeof plugin.initialize !== 'function') return;
+      plugin.initialize(this.getPluginMethods());
+    });
   }
 
   componentDidMount(){
@@ -121,6 +134,17 @@ export default class DanteEditor extends React.Component {
   componentDidUpdate(prevProps){
     if(prevProps.content && prevProps.content != this.props.content)
       this.updateState()
+  }
+
+  componentWillUnmount() {
+    this.resolvePlugins().forEach(plugin => {
+      if (plugin.willUnmount) {
+        plugin.willUnmount({
+          getEditorState: this.getEditorState,
+          setEditorState: this.onChange,
+        });
+      }
+    });
   }
 
   initializeState = ()=> {
@@ -881,9 +905,155 @@ export default class DanteEditor extends React.Component {
     this.focus = true
   }
 
+  getPluginMethods = () => ({
+    getPlugins: this.getPlugins,
+    getProps: this.getProps,
+    setEditorState: this.onChange,
+    getEditorState: this.getEditorState,
+    getReadOnly: this.getReadOnly,
+    setReadOnly: this.setReadOnly,
+    getEditorRef: this.getEditorRef,
+  });
+
+
+  createEventHooks = (methodName, plugins) => (...args) => {
+    const newArgs = [].slice.apply(args);
+    newArgs.push(this.getPluginMethods());
+
+    return plugins.some(
+      plugin =>
+        typeof plugin[methodName] === 'function' &&
+        plugin[methodName](...newArgs) === true
+    );
+  };
+
+  createHandleHooks = (methodName, plugins) => (...args) => {
+    const newArgs = [].slice.apply(args);
+    newArgs.push(this.getPluginMethods());
+
+    return plugins.some(
+      plugin =>
+        typeof plugin[methodName] === 'function' &&
+        plugin[methodName](...newArgs) === 'handled'
+    )
+      ? 'handled'
+      : 'not-handled';
+  };
+
+  createFnHooks = (methodName, plugins) => (...args) => {
+    const newArgs = [].slice.apply(args);
+
+    newArgs.push(this.getPluginMethods());
+
+    if (methodName === 'blockRendererFn') {
+      let block = { props: {} };
+      plugins.forEach(plugin => {
+        if (typeof plugin[methodName] !== 'function') return;
+        const result = plugin[methodName](...newArgs);
+        if (result !== undefined && result !== null) {
+          const { props: pluginProps, ...pluginRest } = result; // eslint-disable-line no-use-before-define
+          const { props, ...rest } = block; // eslint-disable-line no-use-before-define
+          block = {
+            ...rest,
+            ...pluginRest,
+            props: { ...props, ...pluginProps },
+          };
+        }
+      });
+
+      return block.component ? block : false;
+    } else if (methodName === 'blockStyleFn') {
+      let styles;
+      plugins.forEach(plugin => {
+        if (typeof plugin[methodName] !== 'function') return;
+        const result = plugin[methodName](...newArgs);
+        if (result !== undefined && result !== null) {
+          styles = (styles ? `${styles} ` : '') + result;
+        }
+      });
+
+      return styles || '';
+    }
+
+    let result;
+    const wasHandled = plugins.some(plugin => {
+      if (typeof plugin[methodName] !== 'function') return false;
+      result = plugin[methodName](...newArgs);
+      return result !== undefined;
+    });
+    return wasHandled ? result : false;
+  };
+
+  createPluginHooks = () => {
+    const pluginHooks = {};
+    const eventHookKeys = [];
+    const handleHookKeys = [];
+    const fnHookKeys = [];
+    const plugins = [this.props, ...this.resolvePlugins()];
+
+    plugins.forEach(plugin => {
+      Object.keys(plugin).forEach(attrName => {
+        if (attrName === 'onChange') return;
+
+        // if `attrName` has been added as a hook key already, ignore this one
+        if (
+          eventHookKeys.indexOf(attrName) !== -1 ||
+          fnHookKeys.indexOf(attrName) !== -1
+        )
+          return;
+
+        const isEventHookKey = attrName.indexOf('on') === 0;
+        if (isEventHookKey) {
+          eventHookKeys.push(attrName);
+          return;
+        }
+
+        const isHandleHookKey = attrName.indexOf('handle') === 0;
+        if (isHandleHookKey) {
+          handleHookKeys.push(attrName);
+          return;
+        }
+
+        // checks if `attrName` ends with 'Fn'
+        const isFnHookKey = attrName.length - 2 === attrName.indexOf('Fn');
+        if (isFnHookKey) {
+          fnHookKeys.push(attrName);
+        }
+      });
+    });
+
+    eventHookKeys.forEach(attrName => {
+      pluginHooks[attrName] = this.createEventHooks(attrName, plugins);
+    });
+
+    handleHookKeys.forEach(attrName => {
+      pluginHooks[attrName] = this.createHandleHooks(attrName, plugins);
+    });
+
+    fnHookKeys.forEach(attrName => {
+      pluginHooks[attrName] = this.createFnHooks(attrName, plugins);
+    });
+
+    return pluginHooks;
+  };
+
+  resolvePlugins = () => {
+    const plugins = this.props.plugins.slice(0);
+    if (this.props.defaultKeyBindings === true) {
+      plugins.push(defaultKeyBindings);
+    }
+    if (this.props.defaultKeyCommands === true) {
+      plugins.push(defaultKeyCommands);
+    }
+
+    return plugins;
+  };
+
   //##############################
 
   render() {
+    const pluginHooks = this.createPluginHooks();
+
     return (
       <div suppressContentEditableWarning={ true }>
         
@@ -893,6 +1063,7 @@ export default class DanteEditor extends React.Component {
                  //onClick={ this.focus }
                  >
               <Editor
+                {...pluginHooks}
                 blockRendererFn={ this.blockRenderer }
                 editorState={ this.state.editorState }
                 onBlur={this.onBlur}
